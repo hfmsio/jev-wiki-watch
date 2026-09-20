@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Wikipedia Vandalism Watch</title>
+<style>
+  body { font: 14px system-ui; margin: 16px; background: #fff; color: #222; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { padding: 4px 8px; border-bottom: 1px solid #eee; text-align: left; white-space: nowrap; }
+  td.c { white-space: normal; max-width: 40vw; color: #666; }
+  .FLAG { background: #fde2e2; } .REVIEW { background: #fff4d6; }
+  #stats { color: #666; margin-bottom: 8px; }
+</style>
+<h2>Wikipedia Vandalism Watch <small>live English edits, judged by Jev</small></h2>
+<div id="stats">waiting for edits...</div>
+<table><tr><th>lane</th><th>vandal</th><th>spam</th><th>article</th><th>user</th><th>edit summary</th><th>ms</th></tr><tbody id="rows"></tbody></table>
+<script>
+  const questions = {
+    vandalism: { type: "noul", instructions: "This edit damages the article on purpose: nonsense, insults, blanking, or false facts." },
+    spam: { type: "noul", instructions: "This edit adds advertising, self promotion, or spam links." },
+  };
+  const lane = (v, s) => Math.max(v, s) >= 0.8 ? "FLAG" : Math.max(v, s) >= 0.4 ? "REVIEW" : "OK";
+  let seen = 0, checked = 0, totalMs = 0, tokens = 0, inflight = 0;
+
+  async function diffText(e) {
+    const u = `https://en.wikipedia.org/w/api.php?action=compare&fromrev=${e.revision.old}&torev=${e.revision.new}&prop=diff&difftype=unified&format=json&origin=*`;
+    const html = (await (await fetch(u)).json()).compare["*"];
+    const t = new DOMParser().parseFromString(html, "text/html").body.textContent;
+    return t.split("\n").filter(l => /^[+-]/.test(l)).join("\n").slice(0, 3000);
+  }
+
+  async function judge(e) {
+    inflight++;
+    try {
+      const state = { article: e.title, user: e.user, summary: e.comment, bytes_changed: e.length.new - e.length.old, diff: await diffText(e) };
+      const t0 = performance.now();
+      const r = await (await fetch("/jev", { method: "POST", body: JSON.stringify({ state, model: "jev-latest", questions }) })).json();
+      const ms = Math.round(performance.now() - t0);
+      const v = r.answers.vandalism.noul, s = r.answers.spam.noul, L = lane(v, s);
+      checked++; totalMs += ms; tokens += r.usage?.input_tokens ?? 0;
+      const url = `https://en.wikipedia.org/w/index.php?diff=${e.revision.new}`;
+      rows.insertAdjacentHTML("afterbegin", `<tr class="${L}"><td>${L}</td><td>${(v * 100).toFixed(0)}%</td><td>${(s * 100).toFixed(0)}%</td>
+        <td><a href="${url}" target="_blank">${e.title}</a></td><td>${e.user}</td><td class="c">${e.comment}</td><td>${ms}</td></tr>`);
+      if (rows.children.length > 200) rows.lastChild.remove();
+    } catch (err) { console.warn(err); } finally { inflight--; }
+  }
+
+  new EventSource("https://stream.wikimedia.org/v2/stream/recentchange").onmessage = ({ data }) => {
+    const e = JSON.parse(data);
+    if (e.meta.domain !== "en.wikipedia.org" || e.type !== "edit" || e.namespace !== 0 || e.bot) return;
+    seen++;
+    if (inflight < 4) judge(e);
+    stats.textContent = `edits seen ${seen}, judged ${checked}, avg ${checked ? Math.round(totalMs / checked) : 0} ms, ~$${(tokens * 0.042 / 1e6).toFixed(4)} spent`;
+  };
+</script>
